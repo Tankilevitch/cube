@@ -21,11 +21,8 @@ use crate::stream::OnDrainHandler;
 use crate::tokio_runtime_node;
 use crate::transport::NodeBridgeTransport;
 use crate::utils::{batch_to_rows, NonDebugInRelease};
-use cubenativeutils::wrappers::neon::context::neon_run_with_guarded_lifetime;
+use cubenativeutils::wrappers::neon::context::neon_guarded_funcion_call;
 use cubenativeutils::wrappers::neon::inner_types::NeonInnerTypes;
-use cubenativeutils::wrappers::neon::object::NeonObject;
-use cubenativeutils::wrappers::object_handle::NativeObjectHandle;
-use cubenativeutils::wrappers::serializer::NativeDeserialize;
 use cubenativeutils::wrappers::NativeContextHolder;
 use cubesqlplanner::cube_bridge::base_query_options::NativeBaseQueryOptions;
 use cubesqlplanner::planner::base_query::BaseQuery;
@@ -226,6 +223,7 @@ async fn handle_sql_query(
     channel: Arc<Channel>,
     stream_methods: WritableStreamMethods,
     sql_query: &str,
+    cache_mode: &str,
 ) -> Result<(), CubeError> {
     let span_id = Some(Arc::new(SpanId::new(
         Uuid::new_v4().to_string(),
@@ -253,6 +251,17 @@ async fn handle_sql_query(
                     }),
                 )
                 .await?;
+        }
+
+        let cache_enum = cache_mode.parse().map_err(CubeError::user)?;
+
+        {
+            let mut cm = session
+                .state
+                .cache_mode
+                .write()
+                .expect("failed to unlock session cache_mode for change");
+            *cm = Some(cache_enum);
         }
 
         let session_clone = Arc::clone(&session);
@@ -427,6 +436,8 @@ fn exec_sql(mut cx: FunctionContext) -> JsResult<JsValue> {
         Err(_) => None,
     };
 
+    let cache_mode = cx.argument::<JsString>(4)?.value(&mut cx);
+
     let js_stream_on_fn = Arc::new(
         node_stream
             .get::<JsFunction, _, _>(&mut cx, "on")?
@@ -474,6 +485,7 @@ fn exec_sql(mut cx: FunctionContext) -> JsResult<JsValue> {
             channel.clone(),
             stream_methods,
             &sql_query,
+            &cache_mode,
         )
         .await;
 
@@ -603,41 +615,15 @@ pub fn reset_logger(mut cx: FunctionContext) -> JsResult<JsUndefined> {
 //============ sql planner ===================
 
 fn build_sql_and_params(cx: FunctionContext) -> JsResult<JsValue> {
-    neon_run_with_guarded_lifetime(cx, |neon_context_holder| {
-        let options =
-            NativeObjectHandle::<NeonInnerTypes<FunctionContext<'static>>>::new(NeonObject::new(
-                neon_context_holder.clone(),
-                neon_context_holder
-                    .with_context(|cx| cx.argument::<JsValue>(0))
-                    .unwrap()?,
-            ));
+    neon_guarded_funcion_call(
+        cx,
+        |context_holder: NativeContextHolder<_>,
+         options: NativeBaseQueryOptions<NeonInnerTypes<FunctionContext<'static>>>| {
+            let base_query = BaseQuery::try_new(context_holder.clone(), Rc::new(options))?;
 
-        let safe_call_fn = neon_context_holder
-            .with_context(|cx| {
-                if let Ok(func) = cx.argument::<JsFunction>(1) {
-                    Some(func)
-                } else {
-                    None
-                }
-            })
-            .unwrap();
-
-        neon_context_holder.set_safe_call_fn(safe_call_fn).unwrap();
-
-        let context_holder = NativeContextHolder::<NeonInnerTypes<FunctionContext<'static>>>::new(
-            neon_context_holder,
-        );
-
-        let base_query_options = Rc::new(NativeBaseQueryOptions::from_native(options).unwrap());
-
-        let base_query = BaseQuery::try_new(context_holder.clone(), base_query_options).unwrap();
-
-        let res = base_query.build_sql_and_params();
-
-        let result: NeonObject<FunctionContext<'static>> = res.into_object();
-        let result = result.into_object();
-        Ok(result)
-    })
+            base_query.build_sql_and_params()
+        },
+    )
 }
 
 fn debug_js_to_clrepr_to_js(mut cx: FunctionContext) -> JsResult<JsValue> {

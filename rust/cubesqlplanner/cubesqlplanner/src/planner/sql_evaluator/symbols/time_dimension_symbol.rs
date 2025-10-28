@@ -135,6 +135,18 @@ impl TimeDimensionSymbol {
             .collect()
     }
 
+    pub fn apply_to_deps<F: Fn(&Rc<MemberSymbol>) -> Result<Rc<MemberSymbol>, CubeError>>(
+        &self,
+        f: &F,
+    ) -> Result<Rc<MemberSymbol>, CubeError> {
+        let mut result = self.clone();
+        if let Some(granularity_obj) = &self.granularity_obj {
+            result.granularity_obj = Some(granularity_obj.apply_to_deps(f)?);
+        }
+        result.base_symbol = f(&self.base_symbol)?;
+        Ok(MemberSymbol::new_time_dimension(Rc::new(result)))
+    }
+
     pub fn get_dependencies(&self) -> Vec<Rc<MemberSymbol>> {
         let mut deps = vec![];
         if let Some(granularity_obj) = &self.granularity_obj {
@@ -161,6 +173,13 @@ impl TimeDimensionSymbol {
 
     pub fn cube_name(&self) -> String {
         self.base_symbol.cube_name()
+    }
+
+    pub fn join_map(&self) -> &Option<Vec<Vec<String>>> {
+        match self.base_symbol.as_ref() {
+            MemberSymbol::Dimension(d) => d.join_map(),
+            _ => &None,
+        }
     }
 
     pub fn is_multi_stage(&self) -> bool {

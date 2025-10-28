@@ -24,11 +24,16 @@ impl PreAggregationOptimizer {
         }
     }
 
-    pub fn try_optimize(&mut self, plan: Rc<Query>) -> Result<Option<Rc<Query>>, CubeError> {
+    pub fn try_optimize(
+        &mut self,
+        plan: Rc<Query>,
+        disable_external_pre_aggregations: bool,
+    ) -> Result<Option<Rc<Query>>, CubeError> {
         let cube_names = collect_cube_names_from_node(&plan)?;
         let mut compiler = PreAggregationsCompiler::try_new(self.query_tools.clone(), &cube_names)?;
 
-        let compiled_pre_aggregations = compiler.compile_all_pre_aggregations()?;
+        let compiled_pre_aggregations =
+            compiler.compile_all_pre_aggregations(disable_external_pre_aggregations)?;
 
         for pre_aggregation in compiled_pre_aggregations.iter() {
             let new_query = self.try_rewrite_query(plan.clone(), pre_aggregation)?;
@@ -49,7 +54,7 @@ impl PreAggregationOptimizer {
         query: Rc<Query>,
         pre_aggregation: &Rc<CompiledPreAggregation>,
     ) -> Result<Option<Rc<Query>>, CubeError> {
-        if query.multistage_members.is_empty() {
+        if query.multistage_members().is_empty() {
             self.try_rewrite_simple_query(&query, pre_aggregation)
         } else if !self.allow_multi_stage {
             Ok(None)
@@ -63,10 +68,9 @@ impl PreAggregationOptimizer {
         query: &Rc<Query>,
         pre_aggregation: &Rc<CompiledPreAggregation>,
     ) -> Result<Option<Rc<Query>>, CubeError> {
-        if self.is_schema_and_filters_match(&query.schema, &query.filter, pre_aggregation)? {
+        if self.is_schema_and_filters_match(&query.schema(), &query.filter(), pre_aggregation)? {
             let mut new_query = query.as_ref().clone();
-            new_query.source =
-                QuerySource::PreAggregation(self.make_pre_aggregation_source(pre_aggregation)?);
+            new_query.set_source(self.make_pre_aggregation_source(pre_aggregation)?.into());
             Ok(Some(Rc::new(new_query)))
         } else {
             Ok(None)
@@ -82,7 +86,7 @@ impl PreAggregationOptimizer {
         let mut has_unrewritten_leaf = false;
 
         let mut rewritten_multistages = Vec::new();
-        for multi_stage in &query.multistage_members {
+        for multi_stage in query.multistage_members() {
             let rewritten = rewriter.rewrite_top_down_with(multi_stage.clone(), |plan_node| {
                 let res = match plan_node {
                     PlanNode::MultiStageLeafMeasure(multi_stage_leaf_measure) => {
@@ -119,9 +123,9 @@ impl PreAggregationOptimizer {
             return Ok(None);
         }
 
-        let source = if let QuerySource::FullKeyAggregate(full_key_aggregate) = &query.source {
+        let source = if let QuerySource::FullKeyAggregate(full_key_aggregate) = query.source() {
             let fk_source = if let Some(resolver_multiplied_measures) =
-                &full_key_aggregate.multiplied_measures_resolver
+                full_key_aggregate.multiplied_measures_resolver()
             {
                 if let ResolvedMultipliedMeasures::ResolveMultipliedMeasures(
                     resolver_multiplied_measures,
@@ -135,18 +139,17 @@ impl PreAggregationOptimizer {
                         let pre_aggregation_source =
                             self.make_pre_aggregation_source(pre_aggregation)?;
 
-                        let pre_aggregation_query = Query {
-                            schema: resolver_multiplied_measures.schema.clone(),
-                            filter: resolver_multiplied_measures.filter.clone(),
-                            modifers: Rc::new(LogicalQueryModifiers {
+                        let pre_aggregation_query = Query::builder()
+                            .schema(resolver_multiplied_measures.schema.clone())
+                            .filter(resolver_multiplied_measures.filter.clone())
+                            .modifers(Rc::new(LogicalQueryModifiers {
                                 offset: None,
                                 limit: None,
                                 ungrouped: false,
                                 order_by: vec![],
-                            }),
-                            source: QuerySource::PreAggregation(pre_aggregation_source),
-                            multistage_members: vec![],
-                        };
+                            }))
+                            .source(pre_aggregation_source.into())
+                            .build();
                         Some(ResolvedMultipliedMeasures::PreAggregation(Rc::new(
                             pre_aggregation_query,
                         )))
@@ -159,20 +162,24 @@ impl PreAggregationOptimizer {
             } else {
                 None
             };
-            let mut result = full_key_aggregate.as_ref().clone();
-            result.multiplied_measures_resolver = fk_source;
-            QuerySource::FullKeyAggregate(Rc::new(result))
+            let result = FullKeyAggregate::builder()
+                .schema(full_key_aggregate.schema().clone())
+                .use_full_join_and_coalesce(full_key_aggregate.use_full_join_and_coalesce())
+                .multiplied_measures_resolver(fk_source)
+                .multi_stage_subquery_refs(full_key_aggregate.multi_stage_subquery_refs().clone())
+                .build();
+            Rc::new(result).into()
         } else {
-            query.source.clone()
+            query.source().clone()
         };
 
-        let result = Query {
-            multistage_members: rewritten_multistages,
-            schema: query.schema.clone(),
-            filter: query.filter.clone(),
-            modifers: query.modifers.clone(),
-            source,
-        };
+        let result = Query::builder()
+            .multistage_members(rewritten_multistages)
+            .schema(query.schema().clone())
+            .filter(query.filter().clone())
+            .modifers(query.modifers().clone())
+            .source(source)
+            .build();
 
         Ok(Some(Rc::new(result)))
     }
@@ -390,20 +397,20 @@ impl PreAggregationOptimizer {
             measures: pre_aggregation.measures.to_vec(),
             multiplied_measures: HashSet::new(),
         };
-        let pre_aggregation = PreAggregation {
-            name: pre_aggregation.name.clone(),
-            time_dimensions: pre_aggregation.time_dimensions.clone(),
-            dimensions: pre_aggregation.dimensions.clone(),
-            measures: pre_aggregation.measures.clone(),
-            schema: Rc::new(schema),
-            external: pre_aggregation.external.unwrap_or_default(),
-            granularity: pre_aggregation.granularity.clone(),
-            source: pre_aggregation.source.clone(),
-            cube_name: pre_aggregation.cube_name.clone(),
-        };
+        let pre_aggregation = PreAggregation::builder()
+            .name(pre_aggregation.name.clone())
+            .time_dimensions(pre_aggregation.time_dimensions.clone())
+            .dimensions(pre_aggregation.dimensions.clone())
+            .measures(pre_aggregation.measures.clone())
+            .schema(Rc::new(schema))
+            .external(pre_aggregation.external.unwrap_or_default())
+            .granularity(pre_aggregation.granularity.clone())
+            .source(pre_aggregation.source.clone())
+            .cube_name(pre_aggregation.cube_name.clone())
+            .build();
         let result = Rc::new(pre_aggregation);
         self.used_pre_aggregations.insert(
-            (result.cube_name.clone(), result.name.clone()),
+            (result.cube_name().clone(), result.name().clone()),
             result.clone(),
         );
         Ok(result)

@@ -2,6 +2,7 @@ use super::{TemplateGroupByColumn, TemplateOrderByColumn, TemplateProjectionColu
 use crate::cube_bridge::driver_tools::DriverTools;
 use crate::cube_bridge::sql_templates_render::SqlTemplatesRender;
 use crate::plan::join::JoinType;
+use crate::planner::sql_templates::structs::TemplateCalcGroup;
 use convert_case::{Boundary, Case, Casing};
 use cubenativeutils::CubeError;
 use minijinja::context;
@@ -160,10 +161,22 @@ impl PlanSqlTemplates {
         } else {
             format!("")
         };
+
+        // For strange reasons, the javascript snake caser used in cube
+        // changes first UPPERCASE letter to "_lowercase", prepending "_"
+        // This is weird, but to be compatible we have to add it too.
+        let mut member_alias = Self::alias_name(name);
+
+        if let Some(fl) = name.chars().next() {
+            if fl.is_uppercase() {
+                member_alias = format!("_{}", member_alias);
+            }
+        }
+
         format!(
             "{}__{}{}",
             Self::alias_name(cube_name),
-            Self::alias_name(name),
+            member_alias,
             suffix
         )
     }
@@ -340,6 +353,42 @@ impl PlanSqlTemplates {
                 from_prepared => from,
                 quoted_min_name => quoted_min_name,
                 quoted_max_name => quoted_max_name
+            },
+        )
+    }
+
+    pub fn calc_groups_join(
+        &self,
+        original_sql: Option<String>,
+        groups: Vec<TemplateCalcGroup>,
+    ) -> Result<String, CubeError> {
+        let groups = groups
+            .into_iter()
+            .map(|g| -> Result<_, CubeError> {
+                let TemplateCalcGroup {
+                    name,
+                    alias,
+                    values,
+                } = g;
+                let name = self.quote_identifier(&name)?;
+                let alias = self.quote_identifier(&alias)?;
+                let values = values
+                    .into_iter()
+                    .map(|v| self.quote_string(&v))
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                Ok(TemplateCalcGroup {
+                    name,
+                    alias,
+                    values,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.render.render_template(
+            "statements/calc_groups_join",
+            context! {
+                original_sql => original_sql,
+                groups => groups
             },
         )
     }

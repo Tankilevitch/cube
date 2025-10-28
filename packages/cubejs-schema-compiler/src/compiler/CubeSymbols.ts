@@ -7,6 +7,7 @@ import { DynamicReference } from './DynamicReference';
 import { camelizeCube } from './utils';
 
 import type { ErrorReporter } from './ErrorReporter';
+import { TranspilerSymbolResolver } from './transpilers';
 
 export type ToString = { toString(): string };
 
@@ -132,6 +133,12 @@ export type AccessPolicyDefinition = {
   };
 };
 
+export type ViewIncludedMember = {
+  type: string;
+  memberPath: string;
+  name: string;
+};
+
 export interface CubeDefinition {
   name: string;
   extends?: (...args: Array<unknown>) => { __cubeName: string };
@@ -158,7 +165,8 @@ export interface CubeDefinition {
   isView?: boolean;
   calendar?: boolean;
   isSplitView?: boolean;
-  includedMembers?: any[];
+  includedMembers?: ViewIncludedMember[];
+  joinMap?: string[][];
   fileName?: string;
 }
 
@@ -193,7 +201,7 @@ export const CONTEXT_SYMBOLS = {
 
 export const CURRENT_CUBE_CONSTANTS = ['CUBE', 'TABLE'];
 
-export class CubeSymbols {
+export class CubeSymbols implements TranspilerSymbolResolver {
   public symbols: Record<string | symbol, CubeSymbolsDefinition>;
 
   private builtCubes: Record<string, CubeDefinitionExtended>;
@@ -561,6 +569,8 @@ export class CubeSymbols {
     // `hierarchies` must be processed first
     const types = ['hierarchies', 'measures', 'dimensions', 'segments'];
 
+    const joinMap: string[][] = [];
+
     for (const type of types) {
       let cubeIncludes: any[] = [];
 
@@ -571,6 +581,11 @@ export class CubeSymbols {
         const fullPath = this.evaluateReferences(null, it.joinPath as () => ToString, { collectJoinHints: true });
         const split = fullPath.split('.');
         const cubeRef = split[split.length - 1];
+
+        // No need to keep a simple direct cube joins in join map
+        if (split.length > 1) {
+          joinMap.push(split);
+        }
 
         if (it.includes === '*') {
           return it;
@@ -613,11 +628,7 @@ export class CubeSymbols {
         existing.map(({ type: t, memberPath, name }) => `${t}|${memberPath}|${name}`)
       );
 
-      const additions: {
-        type: string;
-        memberPath: string;
-        name: string;
-      }[] = [];
+      const additions: ViewIncludedMember[] = [];
 
       for (const { member, name } of cubeIncludes) {
         const parts = member.split('.');
@@ -634,6 +645,8 @@ export class CubeSymbols {
         cube.includedMembers = [...existing, ...additions];
       }
     }
+
+    cube.joinMap = joinMap;
 
     [...memberSets.allMembers].filter(it => !memberSets.resolvedMembers.has(it)).forEach(it => {
       errorReporter.error(`Member '${it}' is included in '${cube.name}' but not defined in any cube`);
